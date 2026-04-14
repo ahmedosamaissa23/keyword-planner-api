@@ -13,6 +13,7 @@ from typing import Optional, List
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
@@ -178,7 +179,15 @@ def _get_historical_metrics(keywords, language, locations):
 # MCP Server (stateless for Vercel serverless)
 # ──────────────────────────────────────────
 
-mcp = FastMCP("keyword_planner_mcp", stateless_http=True)
+mcp = FastMCP(
+    "keyword_planner_mcp",
+    stateless_http=True,
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", "8080")),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
+)
 
 
 class KeywordIdeasInput(BaseModel):
