@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Keyword Planner API — ChatGPT Custom GPT Actions Backend.
+Keyword Planner MCP Server — ChatGPT MCP Integration.
 
-A FastAPI server that exposes Google Ads Keyword Planner as REST endpoints,
-designed to be used as Actions in a ChatGPT Custom GPT.
+An MCP server with SSE transport that exposes Google Ads Keyword Planner
+tools for use in ChatGPT via the New App (MCP) feature.
 """
 
-from __future__ import annotations
-
 import os
-from contextlib import asynccontextmanager
-from typing import Any, Optional
+import json
+from typing import Optional, List, Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Security
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+from mcp.server.fastmcp import FastMCP
 
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
@@ -40,6 +36,21 @@ COMMON_LOCATIONS = {
     "br": "2076", "in": "2356", "jp": "2392", "sa": "2682",
     "ae": "2784", "eg": "2818", "mx": "2484", "tr": "2792",
     "kr": "2410", "nl": "2528",
+}
+
+LANG_NAMES = {
+    "en": "English", "ar": "Arabic", "es": "Spanish", "fr": "French",
+    "de": "German", "pt": "Portuguese", "zh": "Chinese", "ja": "Japanese",
+    "ko": "Korean", "hi": "Hindi", "tr": "Turkish", "it": "Italian",
+    "ru": "Russian", "nl": "Dutch",
+}
+
+LOC_NAMES = {
+    "us": "United States", "uk": "United Kingdom", "ca": "Canada",
+    "au": "Australia", "de": "Germany", "fr": "France", "es": "Spain",
+    "it": "Italy", "br": "Brazil", "in": "India", "jp": "Japan",
+    "sa": "Saudi Arabia", "ae": "UAE", "eg": "Egypt", "mx": "Mexico",
+    "tr": "Turkey", "kr": "South Korea", "nl": "Netherlands",
 }
 
 
@@ -95,7 +106,7 @@ def _get_google_client() -> GoogleAdsClient:
 def _get_customer_id() -> str:
     cid = os.getenv("GOOGLE_ADS_CUSTOMER_ID", "").replace("-", "")
     if not cid:
-        raise RuntimeError("GOOGLE_ADS_CUSTOMER_ID not set in .env")
+        raise RuntimeError("GOOGLE_ADS_CUSTOMER_ID not set")
     return cid
 
 
@@ -103,14 +114,7 @@ def _get_customer_id() -> str:
 # Keyword Planner Logic
 # ──────────────────────────────────────────
 
-def _generate_ideas(
-    keywords: list[str] | None,
-    url: str | None,
-    language: str,
-    locations: list[str],
-    limit: int,
-) -> list[dict[str, Any]]:
-    """Generate keyword ideas from seeds or URL."""
+def _generate_ideas(keywords, url, language, locations, limit):
     client = _get_google_client()
     customer_id = _get_customer_id()
     service = client.get_service("KeywordPlanIdeaService")
@@ -156,12 +160,7 @@ def _generate_ideas(
     return results
 
 
-def _get_historical_metrics(
-    keywords: list[str],
-    language: str,
-    locations: list[str],
-) -> list[dict[str, Any]]:
-    """Get historical metrics for specific keywords."""
+def _get_historical_metrics(keywords, language, locations):
     client = _get_google_client()
     customer_id = _get_customer_id()
     service = client.get_service("KeywordPlanIdeaService")
@@ -206,280 +205,223 @@ def _get_historical_metrics(
 
 
 # ──────────────────────────────────────────
-# Pydantic Models (Request & Response)
+# MCP Server
 # ──────────────────────────────────────────
 
-class KeywordIdeasRequest(BaseModel):
-    """Request body for keyword idea generation."""
-    keywords: Optional[list[str]] = Field(
+mcp = FastMCP("keyword_planner_mcp")
+
+
+# ── Tool: Generate Keyword Ideas ──
+
+class KeywordIdeasInput(BaseModel):
+    """Input for generating keyword ideas."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    keywords: Optional[List[str]] = Field(
         default=None,
-        description="Seed keywords (e.g., ['seo tools', 'keyword research']). Provide keywords, a URL, or both.",
-        json_schema_extra={"example": ["digital marketing", "seo strategy"]},
+        description="Seed keywords, e.g. ['seo tools', 'digital marketing']. Provide keywords, a URL, or both."
     )
     url: Optional[str] = Field(
         default=None,
-        description="URL to extract keyword ideas from.",
-        json_schema_extra={"example": "https://example.com/blog"},
+        description="URL to extract keyword ideas from, e.g. 'https://example.com/blog'"
     )
     language: str = Field(
         default="en",
-        description="Language code: en, ar, es, fr, de, pt, zh, ja, ko, hi, tr, it, ru, nl",
+        description="Language code: en, ar, es, fr, de, pt, zh, ja, ko, hi, tr, it, ru, nl"
     )
-    locations: Optional[list[str]] = Field(
+    locations: Optional[List[str]] = Field(
         default=None,
-        description="Country codes: us, uk, ca, au, de, fr, es, it, br, in, jp, sa, ae, eg, mx, tr, kr, nl",
-        json_schema_extra={"example": ["us"]},
+        description="Country codes: us, uk, ca, au, de, fr, es, it, br, in, jp, sa, ae, eg, mx, tr, kr, nl"
     )
-    limit: int = Field(default=30, ge=1, le=100, description="Max results (1-100).")
+    limit: int = Field(default=30, ge=1, le=100, description="Max number of results (1-100)")
 
 
-class KeywordMetricsRequest(BaseModel):
-    """Request body for keyword historical metrics."""
-    keywords: list[str] = Field(
+@mcp.tool(
+    name="generate_keyword_ideas",
+    annotations={
+        "title": "Generate Keyword Ideas",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def generate_keyword_ideas(params: KeywordIdeasInput) -> str:
+    """Generate keyword suggestions from seed keywords or a webpage URL.
+
+    Returns search volume, competition level, and CPC estimates for each keyword idea.
+    Supports 14 languages and 18 countries.
+
+    Args:
+        params: Keyword ideas input with keywords, url, language, locations, and limit.
+
+    Returns:
+        JSON with total count and keyword_ideas array containing keyword, avg_monthly_searches,
+        competition, competition_index, cpc_low, cpc_high for each result.
+    """
+    try:
+        ideas = _generate_ideas(
+            keywords=params.keywords,
+            url=params.url,
+            language=params.language,
+            locations=params.locations or ["us"],
+            limit=params.limit,
+        )
+        return json.dumps({"total": len(ideas), "keyword_ideas": ideas}, indent=2)
+    except GoogleAdsException as ex:
+        return f"Error: Google Ads API error: {ex.failure.errors[0].message}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ── Tool: Get Keyword Metrics ──
+
+class KeywordMetricsInput(BaseModel):
+    """Input for getting keyword historical metrics."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    keywords: List[str] = Field(
         ...,
-        description="Keywords to get metrics for (max 20).",
-        json_schema_extra={"example": ["digital marketing", "content strategy"]},
+        description="Keywords to get metrics for (max 20), e.g. ['digital marketing', 'content strategy']",
         min_length=1,
         max_length=20,
     )
-    language: str = Field(default="en", description="Language code (e.g., 'en', 'ar').")
-    locations: Optional[list[str]] = Field(
-        default=None,
-        description="Country codes (e.g., ['us', 'sa']).",
+    language: str = Field(default="en", description="Language code (e.g. 'en', 'ar')")
+    locations: Optional[List[str]] = Field(default=None, description="Country codes (e.g. ['us', 'sa'])")
+
+
+@mcp.tool(
+    name="get_keyword_metrics",
+    annotations={
+        "title": "Get Keyword Historical Metrics",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+async def get_keyword_metrics(params: KeywordMetricsInput) -> str:
+    """Get historical search volume, competition, CPC ranges, and monthly trends for specific keywords.
+
+    Returns detailed metrics including monthly search volume history for each keyword.
+
+    Args:
+        params: Keywords list, language, and locations.
+
+    Returns:
+        JSON with total count and keyword_metrics array.
+    """
+    try:
+        metrics = _get_historical_metrics(
+            keywords=params.keywords,
+            language=params.language,
+            locations=params.locations or ["us"],
+        )
+        return json.dumps({"total": len(metrics), "keyword_metrics": metrics}, indent=2)
+    except GoogleAdsException as ex:
+        return f"Error: Google Ads API error: {ex.failure.errors[0].message}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ── Tool: Analyze Competition ──
+
+class CompetitionInput(BaseModel):
+    """Input for competition analysis."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    keywords: List[str] = Field(
+        ...,
+        description="Keywords to analyze competition for",
+        min_length=1,
+        max_length=20,
+    )
+    language: str = Field(default="en", description="Language code")
+    locations: Optional[List[str]] = Field(default=None, description="Country codes")
+    sort_by: str = Field(
+        default="competition",
+        description="Sort by: 'competition', 'volume', 'cpc_low', or 'cpc_high'"
     )
 
 
-class KeywordIdea(BaseModel):
-    keyword: str
-    avg_monthly_searches: int
-    competition: str
-    competition_index: int
-    cpc_low: float
-    cpc_high: float
-
-
-class KeywordMetric(BaseModel):
-    keyword: str
-    avg_monthly_searches: int
-    competition: str
-    competition_index: int
-    cpc_low: float
-    cpc_high: float
-    monthly_search_volumes: list[dict[str, Any]] = []
-
-
-class KeywordIdeasResponse(BaseModel):
-    total: int
-    keyword_ideas: list[KeywordIdea]
-
-
-class KeywordMetricsResponse(BaseModel):
-    total: int
-    keyword_metrics: list[KeywordMetric]
-
-
-class CompetitionAnalysis(BaseModel):
-    keyword: str
-    avg_monthly_searches: int
-    competition: str
-    competition_index: int
-    cpc_low: float
-    cpc_high: float
-    opportunity: str = Field(description="Opportunity level: High, Medium, or Low")
-
-
-class CompetitionResponse(BaseModel):
-    total: int
-    analysis: list[CompetitionAnalysis]
-
-
-# ──────────────────────────────────────────
-# FastAPI App
-# ──────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Validate config on startup."""
-    api_key = os.getenv("API_KEY")
-    if not api_key:
-        print("WARNING: API_KEY not set. Your API is unprotected!")
-    yield
-
-
-app = FastAPI(
-    title="Keyword Planner API",
-    description=(
-        "Google Ads Keyword Planner API for ChatGPT. "
-        "Provides keyword research, search volume data, competition analysis, "
-        "and CPC estimates for SEO and PPC campaigns."
-    ),
-    version="1.0.0",
-    lifespan=lifespan,
-    servers=[
-        {"url": "https://your-domain.com", "description": "Production server"},
-        {"url": "http://localhost:8000", "description": "Local development"},
-    ],
+@mcp.tool(
+    name="analyze_competition",
+    annotations={
+        "title": "Analyze Keyword Competition",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
 )
+async def analyze_competition(params: CompetitionInput) -> str:
+    """Analyze keyword competition and identify opportunities.
 
-# CORS — allow ChatGPT to call the API
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://chat.openai.com", "https://chatgpt.com", "*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    Returns competition data with an opportunity score (High/Medium/Low)
+    based on search volume vs competition level.
 
-# API Key security
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+    Args:
+        params: Keywords, language, locations, and sort_by preference.
 
-
-async def verify_api_key(api_key: str = Security(api_key_header)):
-    """Verify the API key if one is configured."""
-    expected = os.getenv("API_KEY")
-    if expected and api_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
-    return api_key
-
-
-# ──────────────────────────────────────────
-# API Endpoints
-# ──────────────────────────────────────────
-
-@app.post(
-    "/keyword-ideas",
-    response_model=KeywordIdeasResponse,
-    summary="Generate keyword ideas",
-    description="Generate keyword suggestions from seed keywords or a webpage URL. Returns search volume, competition, and CPC data.",
-    tags=["Keyword Research"],
-)
-async def generate_keyword_ideas(
-    body: KeywordIdeasRequest,
-    _key: str = Security(verify_api_key),
-):
-    try:
-        ideas = _generate_ideas(
-            keywords=body.keywords,
-            url=body.url,
-            language=body.language,
-            locations=body.locations or ["us"],
-            limit=body.limit,
-        )
-        return KeywordIdeasResponse(total=len(ideas), keyword_ideas=ideas)
-    except GoogleAdsException as ex:
-        raise HTTPException(status_code=502, detail=f"Google Ads API error: {ex.failure.errors[0].message}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post(
-    "/keyword-metrics",
-    response_model=KeywordMetricsResponse,
-    summary="Get keyword historical metrics",
-    description="Get historical search volume, competition level, CPC ranges, and monthly trends for specific keywords.",
-    tags=["Keyword Research"],
-)
-async def get_keyword_metrics(
-    body: KeywordMetricsRequest,
-    _key: str = Security(verify_api_key),
-):
+    Returns:
+        JSON with total count and analysis array including opportunity scores.
+    """
     try:
         metrics = _get_historical_metrics(
-            keywords=body.keywords,
-            language=body.language,
-            locations=body.locations or ["us"],
-        )
-        return KeywordMetricsResponse(total=len(metrics), keyword_metrics=metrics)
-    except GoogleAdsException as ex:
-        raise HTTPException(status_code=502, detail=f"Google Ads API error: {ex.failure.errors[0].message}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post(
-    "/competition-analysis",
-    response_model=CompetitionResponse,
-    summary="Analyze keyword competition",
-    description="Analyze keyword competition and identify opportunities. Returns competition data with an opportunity score (High/Medium/Low).",
-    tags=["Keyword Research"],
-)
-async def analyze_competition(
-    body: KeywordMetricsRequest,
-    sort_by: str = Query(
-        default="competition",
-        description="Sort by: competition, volume, cpc_low, cpc_high",
-        enum=["competition", "volume", "cpc_low", "cpc_high"],
-    ),
-    _key: str = Security(verify_api_key),
-):
-    try:
-        metrics = _get_historical_metrics(
-            keywords=body.keywords,
-            language=body.language,
-            locations=body.locations or ["us"],
+            keywords=params.keywords,
+            language=params.language,
+            locations=params.locations or ["us"],
         )
 
-        # Add opportunity scores
         analysis = []
         for m in metrics:
             volume = m["avg_monthly_searches"]
             comp_idx = m["competition_index"]
-
             if volume > 1000 and comp_idx < 40:
                 opportunity = "High"
             elif volume > 500 and comp_idx < 60:
                 opportunity = "Medium"
             else:
                 opportunity = "Low"
-
             analysis.append({**m, "opportunity": opportunity})
 
-        # Sort
         sort_keys = {
             "competition": lambda x: x["competition_index"],
             "volume": lambda x: x["avg_monthly_searches"],
             "cpc_low": lambda x: x["cpc_low"],
             "cpc_high": lambda x: x["cpc_high"],
         }
-        analysis.sort(key=sort_keys.get(sort_by, sort_keys["competition"]), reverse=True)
+        analysis.sort(key=sort_keys.get(params.sort_by, sort_keys["competition"]), reverse=True)
 
-        return CompetitionResponse(total=len(analysis), analysis=analysis)
+        return json.dumps({"total": len(analysis), "analysis": analysis}, indent=2)
     except GoogleAdsException as ex:
-        raise HTTPException(status_code=502, detail=f"Google Ads API error: {ex.failure.errors[0].message}")
+        return f"Error: Google Ads API error: {ex.failure.errors[0].message}"
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return f"Error: {str(e)}"
 
 
-@app.get(
-    "/supported-targets",
-    summary="List supported languages and locations",
-    description="Returns all supported language codes and country codes you can use in keyword research requests.",
-    tags=["Reference"],
+# ── Tool: List Supported Targets ──
+
+@mcp.tool(
+    name="list_supported_targets",
+    annotations={
+        "title": "List Supported Languages & Locations",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
 )
-async def list_supported_targets():
-    lang_names = {
-        "en": "English", "ar": "Arabic", "es": "Spanish", "fr": "French",
-        "de": "German", "pt": "Portuguese", "zh": "Chinese", "ja": "Japanese",
-        "ko": "Korean", "hi": "Hindi", "tr": "Turkish", "it": "Italian",
-        "ru": "Russian", "nl": "Dutch",
-    }
-    loc_names = {
-        "us": "United States", "uk": "United Kingdom", "ca": "Canada",
-        "au": "Australia", "de": "Germany", "fr": "France", "es": "Spain",
-        "it": "Italy", "br": "Brazil", "in": "India", "jp": "Japan",
-        "sa": "Saudi Arabia", "ae": "UAE", "eg": "Egypt", "mx": "Mexico",
-        "tr": "Turkey", "kr": "South Korea", "nl": "Netherlands",
-    }
+async def list_supported_targets() -> str:
+    """List all supported language codes and country codes for keyword research.
 
-    return {
-        "languages": [{"code": k, "name": lang_names.get(k, k), "google_id": v} for k, v in COMMON_LANGUAGES.items()],
-        "locations": [{"code": k, "name": loc_names.get(k, k), "google_id": v} for k, v in COMMON_LOCATIONS.items()],
-    }
-
-
-@app.get("/health", include_in_schema=False)
-async def health():
-    return {"status": "ok"}
+    Returns:
+        JSON with languages and locations arrays, each containing code, name, and google_id.
+    """
+    return json.dumps({
+        "languages": [{"code": k, "name": LANG_NAMES.get(k, k), "google_id": v} for k, v in COMMON_LANGUAGES.items()],
+        "locations": [{"code": k, "name": LOC_NAMES.get(k, k), "google_id": v} for k, v in COMMON_LOCATIONS.items()],
+    }, indent=2)
 
 
 # ──────────────────────────────────────────
@@ -487,11 +429,7 @@ async def health():
 # ──────────────────────────────────────────
 
 if __name__ == "__main__":
-    import uvicorn
-
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    print(f"\n  Keyword Planner API starting on http://{host}:{port}")
-    print(f"  OpenAPI docs: http://{host}:{port}/docs")
-    print(f"  OpenAPI JSON: http://{host}:{port}/openapi.json\n")
-    uvicorn.run(app, host=host, port=port)
+    port = int(os.getenv("PORT", "8080"))
+    print(f"\n  Keyword Planner MCP Server starting on port {port}")
+    print(f"  SSE endpoint: http://0.0.0.0:{port}/sse\n")
+    mcp.run(transport="sse", host="0.0.0.0", port=port)
